@@ -92,9 +92,9 @@ fn does_token_fit(token: u8) -> bool {
 ///
 /// Returns the number of bytes written (decompressed) into `output`.
 #[inline]
-pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
+pub(crate) fn decompress_internal<const USE_DICT: bool>(
     input: &[u8],
-    output: &mut S,
+    output: &mut impl Sink,
     ext_dict: &[u8],
 ) -> Result<usize, DecompressError> {
     let mut input_pos = 0;
@@ -323,7 +323,7 @@ fn duplicate_overlapping_slice(
 /// `output` should be preallocated with a size of of the uncompressed data.
 #[inline]
 pub fn decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize, DecompressError> {
-    decompress_internal::<false, _>(input, &mut SliceSink::new(output, 0), b"")
+    decompress_internal::<false>(input, &mut SliceSink::new(output, 0), b"")
 }
 
 /// Decompress all bytes of `input` into `output`.
@@ -335,7 +335,7 @@ pub fn decompress_into_with_dict(
     output: &mut [u8],
     ext_dict: &[u8],
 ) -> Result<usize, DecompressError> {
-    decompress_internal::<true, _>(input, &mut SliceSink::new(output, 0), ext_dict)
+    decompress_internal::<true>(input, &mut SliceSink::new(output, 0), ext_dict)
 }
 
 /// Decompress all bytes of `input` into a new vec. The first 4 bytes are the uncompressed size in
@@ -360,7 +360,7 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, DecompressErro
 pub fn decompress(input: &[u8], min_uncompressed_size: usize) -> Result<Vec<u8>, DecompressError> {
     let mut decompressed: Vec<u8> = vec![0; min_uncompressed_size];
     let decomp_len =
-        decompress_internal::<false, _>(input, &mut SliceSink::new(&mut decompressed, 0), b"")?;
+        decompress_internal::<false>(input, &mut SliceSink::new(&mut decompressed, 0), b"")?;
     decompressed.truncate(decomp_len);
     Ok(decompressed)
 }
@@ -394,7 +394,7 @@ pub fn decompress_with_dict(
 ) -> Result<Vec<u8>, DecompressError> {
     let mut decompressed: Vec<u8> = vec![0; min_uncompressed_size];
     let decomp_len =
-        decompress_internal::<true, _>(input, &mut SliceSink::new(&mut decompressed, 0), ext_dict)?;
+        decompress_internal::<true>(input, &mut SliceSink::new(&mut decompressed, 0), ext_dict)?;
     decompressed.truncate(decomp_len);
     Ok(decompressed)
 }

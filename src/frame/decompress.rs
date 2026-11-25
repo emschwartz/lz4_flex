@@ -285,7 +285,7 @@ impl<R: io::Read> FrameDecoder<R> {
                     let ext_dict = &tail[..self.ext_dict_len];
 
                     debug_assert!(head.len() - self.dst_start >= max_block_size);
-                    crate::block::decompress::decompress_internal::<true, _>(
+                    crate::block::decompress::decompress_internal::<true>(
                         &self.src[..len],
                         &mut SliceSink::new(head, self.dst_start),
                         ext_dict,
@@ -293,7 +293,7 @@ impl<R: io::Read> FrameDecoder<R> {
                 } else {
                     // Independent blocks OR linked blocks with only prefix data
                     debug_assert!(self.dst.capacity() - self.dst_start >= max_block_size);
-                    crate::block::decompress::decompress_internal::<false, _>(
+                    crate::block::decompress::decompress_internal::<false>(
                         &self.src[..len],
                         &mut vec_sink_for_decompression(
                             &mut self.dst,

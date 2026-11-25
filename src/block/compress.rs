@@ -1015,7 +1015,7 @@ mod tests {
         uncompressed[..output_start].copy_from_slice(&dict[dict_cutoff..]);
         let uncomp_len = {
             let mut sink = SliceSink::new(&mut uncompressed[..], output_start);
-            crate::block::decompress::decompress_internal::<true, _>(
+            crate::block::decompress::decompress_internal::<true>(
                 &compressed,
                 &mut sink,
                 &dict[..dict_cutoff],

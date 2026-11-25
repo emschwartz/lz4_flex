@@ -44,7 +44,7 @@ pub(crate) fn vec_sink_for_decompression(
 
 pub(crate) trait Sink {
     /// Returns a raw ptr to the first unfilled byte of the Sink. Analogous to `[pos..].as_ptr()`.
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     #[allow(dead_code)]
     unsafe fn pos_mut_ptr(&mut self) -> *mut u8;
 
@@ -56,14 +56,14 @@ pub(crate) trait Sink {
     #[cfg(feature = "safe-encode")]
     fn push(&mut self, byte: u8);
 
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     unsafe fn base_mut_ptr(&mut self) -> *mut u8;
 
     fn pos(&self) -> usize;
 
     fn capacity(&self) -> usize;
 
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     unsafe fn set_pos(&mut self, new_pos: usize);
 
     #[cfg(feature = "safe-decode")]
@@ -113,10 +113,20 @@ impl<'a> SliceSink<'a> {
     }
 }
 
+#[cfg(not(feature = "safe-decode"))]
+impl SliceSink<'_> {
+    /// Returns the whole buffer and a mutable reference to the position, for the unsafe
+    /// decoder.
+    #[inline]
+    pub(crate) fn buf_and_pos_mut(&mut self) -> (&mut [u8], &mut usize) {
+        (self.output, &mut self.pos)
+    }
+}
+
 impl Sink for SliceSink<'_> {
     /// Returns a raw ptr to the first unfilled byte of the Sink. Analogous to `[pos..].as_ptr()`.
     #[inline]
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     unsafe fn pos_mut_ptr(&mut self) -> *mut u8 {
         unsafe { self.base_mut_ptr().add(self.pos()) as *mut u8 }
     }
@@ -135,7 +145,7 @@ impl Sink for SliceSink<'_> {
         self.pos += 1;
     }
 
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     unsafe fn base_mut_ptr(&mut self) -> *mut u8 {
         self.output.as_mut_ptr()
     }
@@ -150,7 +160,7 @@ impl Sink for SliceSink<'_> {
         self.output.len()
     }
 
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     #[inline]
     unsafe fn set_pos(&mut self, new_pos: usize) {
         debug_assert!(new_pos <= self.capacity());
@@ -204,10 +214,7 @@ impl Sink for SliceSink<'_> {
 /// space.
 ///
 ///
-#[cfg(all(
-    feature = "alloc",
-    not(all(feature = "safe-encode", feature = "safe-decode"))
-))]
+#[cfg(all(feature = "alloc", not(feature = "safe-encode")))]
 pub(crate) struct PtrSink {
     /// The working slice, which may contain uninitialized bytes
     output: *mut u8,
@@ -217,10 +224,7 @@ pub(crate) struct PtrSink {
     cap: usize,
 }
 
-#[cfg(all(
-    feature = "alloc",
-    not(all(feature = "safe-encode", feature = "safe-decode"))
-))]
+#[cfg(all(feature = "alloc", not(feature = "safe-encode")))]
 impl PtrSink {
     /// Creates a `Sink` backed by the given byte slice.
     /// `pos` defines the initial output position in the Sink.
@@ -243,14 +247,11 @@ impl PtrSink {
     }
 }
 
-#[cfg(all(
-    feature = "alloc",
-    not(all(feature = "safe-encode", feature = "safe-decode"))
-))]
+#[cfg(all(feature = "alloc", not(feature = "safe-encode")))]
 impl Sink for PtrSink {
     /// Returns a raw ptr to the first unfilled byte of the Sink. Analogous to `[pos..].as_ptr()`.
     #[inline]
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     unsafe fn pos_mut_ptr(&mut self) -> *mut u8 {
         unsafe { self.base_mut_ptr().add(self.pos()) as *mut u8 }
     }
@@ -261,17 +262,7 @@ impl Sink for PtrSink {
         unsafe { self.output.add(pos).read() }
     }
 
-    /// Pushes a byte to the end of the Sink.
-    #[inline]
-    #[cfg(feature = "safe-encode")]
-    fn push(&mut self, byte: u8) {
-        unsafe {
-            self.pos_mut_ptr().write(byte);
-        }
-        self.pos += 1;
-    }
-
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     unsafe fn base_mut_ptr(&mut self) -> *mut u8 {
         self.output
     }
@@ -286,7 +277,7 @@ impl Sink for PtrSink {
         self.cap
     }
 
-    #[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
+    #[cfg(not(feature = "safe-encode"))]
     #[inline]
     unsafe fn set_pos(&mut self, new_pos: usize) {
         debug_assert!(new_pos <= self.capacity());

@@ -48,6 +48,9 @@ alloc = []
 # use nightly compiler features
 nightly = []
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash32"], optional = true }
 

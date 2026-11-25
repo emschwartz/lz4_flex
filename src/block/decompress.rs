@@ -1,119 +1,190 @@
-//! The block decompression algorithm.
+//! The block decompression algorithm (unsafe fast variant, used without `safe-decode`).
+//!
+//! # Safety design
+//!
+//! All `unsafe` code lives in the [`prim`] module: a handful of fixed-size or bounded copies,
+//! each with a written precondition stated in terms of slice indices. The decoder itself is safe
+//! code over `(slice, index)` pairs. It never forms an out-of-bounds pointer. Before each call
+//! into [`prim`], it establishes the precondition with an integer comparison of the form
+//! `n <= len - pos`, which cannot overflow because `pos <= len` is an invariant of [`Decoder`].
+//!
+//! The fast path in [`Decoder::try_fast_sequence`] checks a single input and output margin up
+//! front. That one check covers every copy the sequence makes, so the hot loop needs no
+//! per-access checks.
+//!
+//! The output is `&mut [MaybeUninit<u8>]`, so it can be a `Vec`'s spare capacity. The decoder
+//! keeps `out[..op]` initialized: it only writes at `op` and beyond, and a byte becomes part of
+//! `out[..op]` only when a copy whose source was initialized writes it.
+//!
+//! The Kani proofs in `verification` check every primitive against its precondition, check that
+//! each decoder step preserves the invariants, and run the whole decoder on all small inputs.
 use crate::block::{DecompressError, MINMATCH};
-use crate::fastcpy_unsafe;
-#[cfg(feature = "alloc")]
-use crate::sink::PtrSink;
-use crate::sink::Sink;
 use crate::sink::SliceSink;
 #[cfg(feature = "alloc")]
 #[allow(unused_imports)]
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
-/// Copies data to output_ptr by self-referential copy from start and match_length
-#[inline]
-unsafe fn duplicate(
-    output_ptr: &mut *mut u8,
-    output_end: *mut u8,
-    start: *const u8,
-    match_length: usize,
-) {
-    // We cannot simply use memcpy or `extend_from_slice`, because these do not allow
-    // self-referential copies: http://ticki.github.io/img/lz4_runs_encoding_diagram.svg
+/// Input bytes the fast path may touch after the token: a 16-byte wild literal copy, the
+/// 2-byte match offset and the next token.
+const FAST_INPUT_MARGIN: usize = 16 + 2 + 1;
+/// Output bytes the fast path may touch: a 16-byte wild literal copy and an 18-byte wild match
+/// copy.
+const FAST_OUTPUT_MARGIN: usize = 16 + 18;
+/// Extra output margin in dictionary mode, where a dictionary copy of up to 17 bytes can come
+/// before the 18-byte wild match copy.
+const FAST_DICT_MARGIN: usize = 17;
 
-    // Considering that `wild_copy_match_16` can copy up to `16 - 1` extra bytes.
-    // Defer to `duplicate_overlapping` in case of an overlapping match
-    // OR the if the wild copy would copy beyond the end of the output.
-    unsafe {
-        if (output_ptr.offset_from(start) as usize) < match_length + 16 - 1
-            || (output_end.offset_from(*output_ptr) as usize) < match_length + 16 - 1
-        {
-            duplicate_overlapping(output_ptr, start, match_length);
-        } else {
-            debug_assert!(
-                output_ptr.add(match_length / 16 * 16 + ((match_length % 16) != 0) as usize * 16)
-                    <= output_end
-            );
-            wild_copy_from_src_16(start, *output_ptr, match_length);
-            *output_ptr = output_ptr.add(match_length);
+/// The only `unsafe` code in the decoder. Every function states its precondition in terms of
+/// slice lengths, and the Kani proofs in `verification` check that each precondition is
+/// sufficient.
+mod prim {
+    use core::mem::MaybeUninit;
+    use core::ptr;
+
+    /// Copies `N` bytes from `src[s..s + N]` to `dst[d..d + N]`.
+    ///
+    /// # Safety
+    /// `s + N <= src.len()` and `d + N <= dst.len()`.
+    #[inline(always)]
+    pub(super) unsafe fn copy_fixed<const N: usize>(
+        src: &[u8],
+        s: usize,
+        dst: &mut [MaybeUninit<u8>],
+        d: usize,
+    ) {
+        debug_assert!(s <= src.len() && N <= src.len() - s);
+        debug_assert!(d <= dst.len() && N <= dst.len() - d);
+        // SAFETY: both ranges are in bounds by the precondition. `src` is a shared borrow and
+        // `dst` a unique one, so they cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr().add(s), dst.as_mut_ptr().add(d).cast::<u8>(), N)
         }
     }
-}
 
-#[inline]
-fn wild_copy_from_src_16(mut source: *const u8, mut dst_ptr: *mut u8, num_items: usize) {
-    // Note: if the compiler auto-vectorizes this it'll hurt performance!
-    // It's not the case for 16 bytes stepsize, but for 8 bytes.
-    unsafe {
-        let dst_ptr_end = dst_ptr.add(num_items);
+    /// Copies `N` bytes from `out[from..from + N]` to `out[to..to + N]`. The ranges may overlap.
+    ///
+    /// # Safety
+    /// `from + N <= out.len()` and `to + N <= out.len()`.
+    #[inline(always)]
+    pub(super) unsafe fn copy_within_fixed<const N: usize>(
+        out: &mut [MaybeUninit<u8>],
+        from: usize,
+        to: usize,
+    ) {
+        debug_assert!(from <= out.len() && N <= out.len() - from);
+        debug_assert!(to <= out.len() && N <= out.len() - to);
+        let base = out.as_mut_ptr().cast::<u8>();
+        // SAFETY: both ranges are in bounds by the precondition. `ptr::copy` allows overlap.
+        unsafe { ptr::copy(base.add(from), base.add(to), N) }
+    }
+
+    /// Reads a little-endian `u16` from `src[s..s + 2]`.
+    ///
+    /// # Safety
+    /// `s + 2 <= src.len()`.
+    #[inline(always)]
+    pub(super) unsafe fn read_u16_le(src: &[u8], s: usize) -> u16 {
+        debug_assert!(s <= src.len() && 2 <= src.len() - s);
+        // SAFETY: in bounds by the precondition. `read_unaligned` has no alignment requirement.
+        u16::from_le_bytes(unsafe { ptr::read_unaligned(src.as_ptr().add(s).cast::<[u8; 2]>()) })
+    }
+
+    /// Copies `len` bytes from `src[s..s + len]` to `dst[d..d + len]`, optimized for short copies.
+    ///
+    /// # Safety
+    /// `len >= 1`, `s + len <= src.len()` and `d + len <= dst.len()`.
+    #[inline(always)]
+    pub(super) unsafe fn copy_var(
+        src: &[u8],
+        s: usize,
+        dst: &mut [MaybeUninit<u8>],
+        d: usize,
+        len: usize,
+    ) {
+        debug_assert!(len >= 1);
+        debug_assert!(s <= src.len() && len <= src.len() - s);
+        debug_assert!(d <= dst.len() && len <= dst.len() - d);
+        // SAFETY: `slice_copy` reads and writes exactly `[0, len)` from its pointers and needs
+        // `len >= 1`. Both ranges are in bounds and cannot overlap (shared vs unique borrow).
+        unsafe {
+            crate::fastcpy_unsafe::slice_copy(
+                src.as_ptr().add(s),
+                dst.as_mut_ptr().add(d).cast::<u8>(),
+                len,
+            )
+        }
+    }
+
+    /// Copies `len` bytes from `out[from..]` to `out[to..]` one byte at a time, front to back, so
+    /// a match may read bytes that the same copy just wrote (`to - from < len`).
+    ///
+    /// # Safety
+    /// `from < to` and `to + len <= out.len()`.
+    #[inline]
+    #[cfg_attr(feature = "nightly", optimize(size))] // to avoid loop unrolling
+    pub(super) unsafe fn copy_overlapping(
+        out: &mut [MaybeUninit<u8>],
+        from: usize,
+        to: usize,
+        len: usize,
+    ) {
+        debug_assert!(from < to);
+        debug_assert!(to <= out.len() && len <= out.len() - to);
+        let base = out.as_mut_ptr().cast::<u8>();
+        let mut i = 0;
+        // Manually unrolled by two: left alone, the compiler unrolls and vectorizes this with a
+        // lot of branches, which does not pay off since long overlapping copies are rare.
+        while i + 1 < len {
+            // SAFETY: `from + i + 1 < to + i + 1 < to + len <= out.len()`.
+            unsafe {
+                ptr::copy(base.add(from + i), base.add(to + i), 1);
+                ptr::copy(base.add(from + i + 1), base.add(to + i + 1), 1);
+            }
+            i += 2;
+        }
+        if i < len {
+            // SAFETY: `from + i < to + i < to + len <= out.len()`.
+            unsafe { ptr::copy(base.add(from + i), base.add(to + i), 1) }
+        }
+    }
+
+    /// Copies `len` bytes from `out[from..]` to `out[to..]` in 16-byte chunks. Writes up to 15
+    /// bytes past `to + len`, and reads up to 15 bytes past `from + len`.
+    ///
+    /// # Safety
+    /// `len >= 1`, `from + len + 15 <= to` and `to + len + 15 <= out.len()`.
+    #[inline]
+    pub(super) unsafe fn wild_copy_within_16(
+        out: &mut [MaybeUninit<u8>],
+        from: usize,
+        to: usize,
+        len: usize,
+    ) {
+        debug_assert!(len >= 1);
+        debug_assert!(from <= to && len + 15 <= to - from);
+        debug_assert!(to <= out.len() && len + 15 <= out.len() - to);
+        let base = out.as_mut_ptr().cast::<u8>();
+        // Note: if the compiler auto-vectorizes this it'll hurt performance!
+        // It's not the case for 16 bytes stepsize, but for 8 bytes.
+        let mut i = 0;
         loop {
-            core::ptr::copy_nonoverlapping(source, dst_ptr, 16);
-            source = source.add(16);
-            dst_ptr = dst_ptr.add(16);
-            if dst_ptr >= dst_ptr_end {
+            // SAFETY: `i < len`, so `to + i + 16 <= to + len + 15 <= out.len()`, and
+            // `from + i + 16 <= to + i`, so the two 16-byte ranges do not overlap.
+            unsafe { ptr::copy_nonoverlapping(base.add(from + i), base.add(to + i), 16) }
+            i += 16;
+            if i >= len {
                 break;
             }
         }
     }
-}
 
-/// Copy function, if the data start + match_length overlaps into output_ptr
-#[inline]
-#[cfg_attr(feature = "nightly", optimize(size))] // to avoid loop unrolling
-unsafe fn duplicate_overlapping(
-    output_ptr: &mut *mut u8,
-    mut start: *const u8,
-    match_length: usize,
-) {
-    unsafe {
-        let dst_ptr_end = output_ptr.add(match_length);
-
-        while output_ptr.add(1) < dst_ptr_end {
-            // Note that this loop unrolling is done, so that the compiler doesn't do it in a awful
-            // way.
-            // Without that the compiler will unroll/auto-vectorize the copy with a lot of branches.
-            // This is not what we want, as large overlapping copies are not that common.
-            core::ptr::copy(start, *output_ptr, 1);
-            start = start.add(1);
-            *output_ptr = output_ptr.add(1);
-
-            core::ptr::copy(start, *output_ptr, 1);
-            start = start.add(1);
-            *output_ptr = output_ptr.add(1);
+    /// Copies `src` into `dst[d..d + src.len()]`. Safe: panics if out of bounds.
+    #[inline]
+    pub(super) fn write_slice(dst: &mut [MaybeUninit<u8>], d: usize, src: &[u8]) {
+        for (o, i) in dst[d..d + src.len()].iter_mut().zip(src) {
+            *o = MaybeUninit::new(*i);
         }
-
-        if *output_ptr < dst_ptr_end {
-            core::ptr::copy(start, *output_ptr, 1);
-            *output_ptr = output_ptr.add(1);
-        }
-    }
-}
-
-#[inline]
-unsafe fn copy_from_dict(
-    output_base: *mut u8,
-    output_ptr: &mut *mut u8,
-    ext_dict: &[u8],
-    offset: usize,
-    match_length: usize,
-) -> usize {
-    unsafe {
-        // If we're here we know offset > output pos, so we have at least 1 byte to copy from dict
-        debug_assert!(output_ptr.offset_from(output_base) >= 0);
-        debug_assert!(offset > output_ptr.offset_from(output_base) as usize);
-        // offset falls within ext_dict
-        debug_assert!(ext_dict.len() + output_ptr.offset_from(output_base) as usize >= offset);
-
-        let dict_offset = ext_dict.len() + output_ptr.offset_from(output_base) as usize - offset;
-        // Can't copy past ext_dict len, the match may cross dict and output
-        let dict_match_length = match_length.min(ext_dict.len() - dict_offset);
-        // TODO test fastcpy_unsafe
-        core::ptr::copy_nonoverlapping(
-            ext_dict.as_ptr().add(dict_offset),
-            *output_ptr,
-            dict_match_length,
-        );
-        *output_ptr = output_ptr.add(dict_match_length);
-        dict_match_length
     }
 }
 
@@ -132,53 +203,19 @@ unsafe fn copy_from_dict(
 /// is encoded to _255 + 255 + 255 + 4 = 769_. The bytes after the first 4 is ignored, because
 /// 4 is the first non-0xFF byte.
 #[inline]
-pub(super) fn read_integer_ptr(
-    input_ptr: &mut *const u8,
-    _input_ptr_end: *const u8,
-) -> Result<usize, DecompressError> {
-    // We start at zero and count upwards.
+pub(super) fn read_integer(input: &[u8], input_pos: &mut usize) -> Result<usize, DecompressError> {
     let mut n: usize = 0;
-    // If this byte takes value 255 (the maximum value it can take), another byte is read
-    // and added to the sum. This repeats until a byte lower than 255 is read.
     loop {
-        // We add the next byte until we get a byte which we add to the counting variable.
-
-        // could be skipped with unchecked-decode
-        {
-            if *input_ptr >= _input_ptr_end {
-                return Err(DecompressError::ExpectedAnotherByte);
-            }
-        }
-        let extra = unsafe { input_ptr.read() };
-        *input_ptr = unsafe { input_ptr.add(1) };
-        n += extra as usize;
-
-        // We continue if we got 255, break otherwise.
+        let extra = *input
+            .get(*input_pos)
+            .ok_or(DecompressError::ExpectedAnotherByte)?;
+        *input_pos += 1;
+        // A wrapped sum is harmless: every length is checked against the remaining buffer
+        // before use.
+        n = n.wrapping_add(extra as usize);
         if extra != 0xFF {
-            break;
+            return Ok(n);
         }
-    }
-
-    // 255, 255, 255, 8
-    // 111, 111, 111, 101
-
-    Ok(n)
-}
-
-/// Read the match offset as a little-endian 16-bit integer from the input stream.
-#[inline]
-fn read_match_offset(input_ptr: &mut *const u8) -> Result<u16, DecompressError> {
-    let mut num: u16 = 0;
-    unsafe {
-        core::ptr::copy_nonoverlapping(*input_ptr, &mut num as *mut u16 as *mut u8, 2);
-        *input_ptr = input_ptr.add(2);
-    }
-
-    let offset = u16::from_le(num);
-    if offset == 0 {
-        Err(DecompressError::OffsetZero)
-    } else {
-        Ok(offset)
     }
 }
 
@@ -203,20 +240,242 @@ fn does_token_fit(token: u8) -> bool {
         || (token & FIT_TOKEN_MASK_MATCH) == FIT_TOKEN_MASK_MATCH)
 }
 
-/// Decompress all bytes of `input` into `output`.
+/// Decoder state.
 ///
-/// Returns the number of bytes written (decompressed) into `output`.
+/// # Invariants
+/// - `ip <= input.len()`
+/// - `op <= out.len()`
+/// - `out[..op]` is initialized
+struct Decoder<'a, const USE_DICT: bool> {
+    input: &'a [u8],
+    ip: usize,
+    out: &'a mut [MaybeUninit<u8>],
+    op: usize,
+    ext_dict: &'a [u8],
+}
+
+impl<const USE_DICT: bool> Decoder<'_, USE_DICT> {
+    #[inline(always)]
+    fn read_u8(&mut self) -> Result<u8, DecompressError> {
+        let b = *self
+            .input
+            .get(self.ip)
+            .ok_or(DecompressError::ExpectedAnotherByte)?;
+        self.ip += 1;
+        Ok(b)
+    }
+
+    /// Copies the part of a match that lies in the external dictionary to the output. Requires
+    /// `self.op < offset <= self.op + ext_dict.len()` and `match_length <= out.len() - op`.
+    /// Returns the number of bytes copied.
+    #[inline]
+    fn copy_from_dict(&mut self, offset: usize, match_length: usize) -> usize {
+        debug_assert!(self.op < offset && offset <= self.op + self.ext_dict.len());
+        let dict_offset = self.ext_dict.len() + self.op - offset;
+        // The match may continue past the end of the dictionary into the output.
+        let dict_match_length = match_length.min(self.ext_dict.len() - dict_offset);
+        let src = &self.ext_dict[dict_offset..dict_offset + dict_match_length];
+        prim::write_slice(self.out, self.op, src);
+        self.op += dict_match_length;
+        dict_match_length
+    }
+
+    /// Decodes one whole sequence on the fast path, if `token` needs no extra length bytes and
+    /// both buffers have room for wild copies. Returns `Ok(false)`, consuming nothing, when the
+    /// fast path does not apply.
+    #[inline(always)]
+    fn try_fast_sequence(&mut self, token: u8) -> Result<bool, DecompressError> {
+        let out_margin = FAST_OUTPUT_MARGIN + if USE_DICT { FAST_DICT_MARGIN } else { 0 };
+        if !(does_token_fit(token)
+            && self.input.len() - self.ip >= FAST_INPUT_MARGIN
+            && self.out.len() - self.op > out_margin)
+        {
+            return Ok(false);
+        }
+        // From here on, `ip + 19 <= input.len()` and `op + out_margin < out.len()` for the
+        // values of `ip` and `op` at entry.
+        let literal_length = (token >> 4) as usize; // <= 14, since the token fits
+        let mut match_length = MINMATCH + (token & 0xF) as usize; // <= 18
+
+        // SAFETY: `ip + 16 <= input.len()` and `op + 16 <= out.len()` by the margins.
+        unsafe { prim::copy_fixed::<16>(self.input, self.ip, self.out, self.op) };
+        self.ip += literal_length;
+        self.op += literal_length;
+
+        // SAFETY: `ip` moved by at most 14 of the 19-byte margin, so `ip + 2 <= input.len()`.
+        let offset = unsafe { prim::read_u16_le(self.input, self.ip) } as usize;
+        self.ip += 2;
+        // The margin still leaves at least one byte for the next token.
+        debug_assert!(self.ip < self.input.len());
+
+        if offset == 0 {
+            return Err(DecompressError::OffsetZero);
+        }
+        if offset > self.op + self.ext_dict.len() {
+            return Err(DecompressError::OffsetOutOfBounds);
+        }
+        if USE_DICT && offset > self.op {
+            // `op + 14 + 18 <= out.len()` by the margin, so the dictionary copy fits.
+            let copied = self.copy_from_dict(offset, match_length);
+            if copied == match_length {
+                return Ok(true);
+            }
+            // The match continues from the start of the output.
+            match_length -= copied;
+        }
+
+        let start = self.op - offset;
+        if offset >= match_length {
+            // SAFETY: `start < op`, and `op` moved by at most 14 (literal) + 17 (dictionary) of the
+            // `16 + 18 + 17` margin, so `start + 18 < op + 18 <= out.len()`.
+            unsafe { prim::copy_within_fixed::<18>(self.out, start, self.op) };
+        } else {
+            // SAFETY: `start < op` since `offset >= 1`, and `op + match_length <= out.len()` by the
+            // margin.
+            unsafe { prim::copy_overlapping(self.out, start, self.op, match_length) };
+        }
+        self.op += match_length;
+        Ok(true)
+    }
+
+    /// Copies a match of `match_length` bytes starting at `start` in the output. Requires
+    /// `start < op` and `match_length <= out.len() - op`.
+    #[inline]
+    fn duplicate(&mut self, start: usize, match_length: usize) {
+        debug_assert!(start < self.op);
+        debug_assert!(match_length <= self.out.len() - self.op);
+        // The wild copy can write up to 15 bytes past the match, and needs source and
+        // destination 16 bytes apart. Use the byte-wise copy when either does not hold.
+        if self.op - start < match_length + 15 || self.out.len() - self.op < match_length + 15 {
+            // SAFETY: `start < op` and `op + match_length <= out.len()`.
+            unsafe { prim::copy_overlapping(self.out, start, self.op, match_length) };
+        } else {
+            // SAFETY: `match_length >= 1` (every caller passes a positive length), and both
+            // distances were checked just above.
+            unsafe { prim::wild_copy_within_16(self.out, start, self.op, match_length) };
+        }
+        self.op += match_length;
+    }
+
+    /// Decodes one sequence. Returns `Ok(true)` if more sequences follow and `Ok(false)` at the
+    /// end of the input.
+    #[inline(always)]
+    fn step(&mut self) -> Result<bool, DecompressError> {
+        // The token holds two 4-bit fields: the literal length (high) and the match
+        // length (low).
+        let token = self.read_u8()?;
+
+        // Most sequences fit in a single token and are far from both ends of the buffers.
+        if self.try_fast_sequence(token)? {
+            return Ok(true);
+        }
+
+        // Literals. A length of 15 means more length bytes follow.
+        let mut literal_length = (token >> 4) as usize;
+        if literal_length != 0 {
+            if literal_length == 15 {
+                literal_length =
+                    literal_length.wrapping_add(read_integer(self.input, &mut self.ip)?);
+            }
+            if literal_length > self.input.len() - self.ip {
+                return Err(DecompressError::LiteralOutOfBounds);
+            }
+            if literal_length > self.out.len() - self.op {
+                return Err(DecompressError::OutputTooSmall {
+                    expected: self.op.saturating_add(literal_length),
+                    actual: self.out.len(),
+                });
+            }
+            // SAFETY: `literal_length >= 1`, and both ranges were checked just above.
+            unsafe { prim::copy_var(self.input, self.ip, self.out, self.op, literal_length) };
+            self.ip += literal_length;
+            self.op += literal_length;
+        }
+
+        // The last sequence holds only literals, so the input ends here.
+        if self.ip >= self.input.len() {
+            return Ok(false);
+        }
+
+        if self.input.len() - self.ip < 2 {
+            return Err(DecompressError::ExpectedAnotherByte);
+        }
+        // SAFETY: `ip + 2 <= input.len()`, checked just above.
+        let offset = unsafe { prim::read_u16_le(self.input, self.ip) } as usize;
+        self.ip += 2;
+        if offset == 0 {
+            return Err(DecompressError::OffsetZero);
+        }
+
+        // A match is at least MINMATCH bytes. A low field of 15 means more length bytes
+        // follow.
+        let mut match_length = MINMATCH + (token & 0xF) as usize;
+        if match_length == MINMATCH + 15 {
+            match_length = match_length.wrapping_add(read_integer(self.input, &mut self.ip)?);
+        }
+
+        if offset > self.op + self.ext_dict.len() {
+            return Err(DecompressError::OffsetOutOfBounds);
+        }
+        if match_length > self.out.len() - self.op {
+            return Err(DecompressError::OutputTooSmall {
+                expected: self.op.saturating_add(match_length),
+                actual: self.out.len(),
+            });
+        }
+
+        if USE_DICT && offset > self.op {
+            let copied = self.copy_from_dict(offset, match_length);
+            if copied == match_length {
+                if self.ip >= self.input.len() {
+                    return Err(DecompressError::ExpectedAnotherByte);
+                }
+                return Ok(true);
+            }
+            // The match continues from the start of the output.
+            match_length -= copied;
+        }
+
+        // `offset <= op` here: either it was in bounds of the output, or the dictionary copy
+        // advanced `op` to exactly `offset`. A match length below MINMATCH only happens after
+        // a partial dictionary copy, which leaves at least one byte.
+        let start = self.op - offset;
+        self.duplicate(start, match_length);
+
+        if self.ip >= self.input.len() {
+            return Err(DecompressError::ExpectedAnotherByte);
+        }
+        Ok(true)
+    }
+
+    #[inline(always)]
+    fn run(&mut self) -> Result<(), DecompressError> {
+        while self.step()? {}
+        Ok(())
+    }
+}
+
+/// Decompresses `input` into `out[pos..]`, using `out[..pos]` and then `ext_dict` as the
+/// lookback window. Returns the end position in `out`.
+///
+/// Writes to `out` only copies of bytes from `input`, `ext_dict` and `out` itself. So if `out`
+/// was fully initialized on entry, every write is an initialized byte. On success,
+/// `out[..returned position]` is initialized.
+///
+/// # Panics
+/// Panics if `pos > out.len()`.
 #[inline]
-pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
+fn decompress_core<const USE_DICT: bool>(
     input: &[u8],
-    output: &mut S,
+    out: &mut [MaybeUninit<u8>],
+    pos: usize,
     ext_dict: &[u8],
 ) -> Result<usize, DecompressError> {
+    assert!(pos <= out.len());
     // Prevent segfault for empty input
     if input.is_empty() {
         return Err(DecompressError::ExpectedAnotherByte);
     }
-
     let ext_dict = if USE_DICT {
         ext_dict
     } else {
@@ -224,244 +483,58 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
         debug_assert!(ext_dict.is_empty());
         &[]
     };
-    let output_base = unsafe { output.base_mut_ptr() };
-    let output_end = unsafe { output_base.add(output.capacity()) };
-    let output_start_pos_ptr = unsafe { output.base_mut_ptr().add(output.pos()) as *mut u8 };
-    let mut output_ptr = output_start_pos_ptr;
-
-    let mut input_ptr = input.as_ptr();
-    let input_ptr_end = unsafe { input.as_ptr().add(input.len()) };
-    let safe_distance_from_end =  (16 /* literal copy */ +  2 /* u16 match offset */ + 1 /* The next token to read (we can skip the check) */).min(input.len()) ;
-    let input_ptr_safe = unsafe { input_ptr_end.sub(safe_distance_from_end) };
-
-    let safe_output_ptr = unsafe {
-        let mut output_num_safe_bytes = output
-            .capacity()
-            .saturating_sub(16 /* literal copy */ + 18 /* match copy */);
-        if USE_DICT {
-            // In the dictionary case the output pointer is moved by the match length in the dictionary.
-            // This may be up to 17 bytes without exiting the loop. So we need to ensure that we have
-            // at least additional 17 bytes of space left in the output buffer in the fast loop.
-            output_num_safe_bytes = output_num_safe_bytes.saturating_sub(17);
-        };
-
-        output_base.add(output_num_safe_bytes)
+    let mut decoder = Decoder::<USE_DICT> {
+        input,
+        ip: 0,
+        out,
+        op: pos,
+        ext_dict,
     };
+    decoder.run()?;
+    Ok(decoder.op)
+}
 
-    // Exhaust the decoder by reading and decompressing all blocks until the remaining buffer is
-    // empty.
-    loop {
-        // Read the token. The token is the first byte in a block. It is divided into two 4-bit
-        // subtokens, the higher and the lower.
-        // This token contains to 4-bit "fields", a higher and a lower, representing the literals'
-        // length and the back reference's length, respectively.
-        let token = unsafe { input_ptr.read() };
-        input_ptr = unsafe { input_ptr.add(1) };
+/// Decompress all bytes of `input` into `output`.
+///
+/// Returns the number of bytes written (decompressed) into `output`.
+#[inline]
+pub(crate) fn decompress_internal<const USE_DICT: bool>(
+    input: &[u8],
+    output: &mut SliceSink<'_>,
+    ext_dict: &[u8],
+) -> Result<usize, DecompressError> {
+    let (buf, pos) = output.buf_and_pos_mut();
+    let start = *pos;
+    // SAFETY: `buf` is fully initialized, and `decompress_core` writes only copies of
+    // initialized bytes (from `input`, `ext_dict` and `buf` itself), so `buf` stays a valid
+    // `[u8]`. `MaybeUninit<u8>` has the same layout as `u8`.
+    let out = unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) };
+    let end = decompress_core::<USE_DICT>(input, out, start, ext_dict)?;
+    *pos = end;
+    Ok(end - start)
+}
 
-        // Checking for hot-loop.
-        // In most cases the metadata does fit in a single 1byte token (statistically) and we are in
-        // a safe-distance to the end. This enables some optimized handling.
-        //
-        // Ideally we want to check for safe output pos like: output.pos() <= safe_output_pos; But
-        // that doesn't work when the safe_output_ptr is == output_ptr due to insufficient
-        // capacity. So we use `<` instead of `<=`, which covers that case.
-        if does_token_fit(token)
-            && (input_ptr as usize) <= input_ptr_safe as usize
-            && output_ptr < safe_output_ptr
-        {
-            let literal_length = (token >> 4) as usize;
-            let mut match_length = MINMATCH + (token & 0xF) as usize;
-
-            // output_ptr <= safe_output_ptr should guarantee we have enough space in output
-            debug_assert!(
-                unsafe { output_ptr.add(literal_length + match_length) } <= output_end,
-                "{literal_length} + {match_length} {} wont fit ",
-                literal_length + match_length
-            );
-
-            // Copy the literal
-            // The literal is at max 16 bytes, and the is_safe_distance check assures
-            // that we are far away enough from the end so we can safely copy 16 bytes
-            unsafe {
-                core::ptr::copy_nonoverlapping(input_ptr, output_ptr, 16);
-                input_ptr = input_ptr.add(literal_length);
-                output_ptr = output_ptr.add(literal_length);
-            }
-
-            // input_ptr <= input_ptr_safe should guarantee we have enough space in input
-            debug_assert!(input_ptr_end as usize - input_ptr as usize >= 2);
-            let offset = read_match_offset(&mut input_ptr)? as usize;
-
-            let output_len = unsafe { output_ptr.offset_from(output_base) as usize };
-            if offset > output_len + ext_dict.len() {
-                return Err(DecompressError::OffsetOutOfBounds);
-            }
-
-            // Check if part of the match is in the external dict
-            if USE_DICT && offset > output_len {
-                let copied = unsafe {
-                    copy_from_dict(output_base, &mut output_ptr, ext_dict, offset, match_length)
-                };
-                if copied == match_length {
-                    continue;
-                }
-                // match crosses ext_dict and output
-                match_length -= copied;
-            }
-
-            // Calculate the start of this duplicate segment. At this point offset was already
-            // checked to be in bounds and the external dictionary copy, if any, was
-            // already copied and subtracted from match_length.
-            let start_ptr = unsafe { output_ptr.sub(offset) };
-            debug_assert!(start_ptr >= output_base);
-            debug_assert!(start_ptr < output_end);
-            debug_assert!(unsafe { output_end.offset_from(start_ptr) as usize } >= match_length);
-
-            // In this branch we know that match_length is at most 18 (14 + MINMATCH).
-            // But the blocks can overlap, so make sure they are at least 18 bytes apart
-            // to enable an optimized copy of 18 bytes.
-            if offset >= match_length {
-                unsafe {
-                    // _copy_, not copy_non_overlapping, as it may overlap.
-                    // Compiles to the same assembly on x68_64.
-                    core::ptr::copy(start_ptr, output_ptr, 18);
-                    output_ptr = output_ptr.add(match_length);
-                }
-            } else {
-                unsafe {
-                    duplicate_overlapping(&mut output_ptr, start_ptr, match_length);
-                }
-            }
-
-            continue;
-        }
-
-        // Now, we read the literals section.
-        // Literal Section
-        // If the initial value is 15, it is indicated that another byte will be read and added to
-        // it
-        let mut literal_length = (token >> 4) as usize;
-        if literal_length != 0 {
-            if literal_length == 15 {
-                // The literal_length length took the maximal value, indicating that there is more
-                // than 15 literal_length bytes. We read the extra integer.
-                literal_length += read_integer_ptr(&mut input_ptr, input_ptr_end)? as usize;
-            }
-
-            // could be skipped with unchecked-decode
-            {
-                // Check if literal is out of bounds for the input, and if there is enough space on
-                // the output
-                if literal_length > input_ptr_end as usize - input_ptr as usize {
-                    return Err(DecompressError::LiteralOutOfBounds);
-                }
-                if literal_length > unsafe { output_end.offset_from(output_ptr) as usize } {
-                    return Err(DecompressError::OutputTooSmall {
-                        expected: unsafe { output_ptr.offset_from(output_base) as usize }
-                            + literal_length,
-                        actual: output.capacity(),
-                    });
-                }
-            }
-            unsafe {
-                fastcpy_unsafe::slice_copy(input_ptr, output_ptr, literal_length);
-                output_ptr = output_ptr.add(literal_length);
-                input_ptr = input_ptr.add(literal_length);
-            }
-        }
-
-        // If the input stream is emptied, we break out of the loop. This is only the case
-        // in the end of the stream, since the block is intact otherwise.
-        if input_ptr >= input_ptr_end {
-            break;
-        }
-
-        // Read duplicate section
-        // could be skipped with unchecked-decode
-        {
-            if (input_ptr_end as usize) - (input_ptr as usize) < 2 {
-                return Err(DecompressError::ExpectedAnotherByte);
-            }
-        }
-        let offset = read_match_offset(&mut input_ptr)? as usize;
-        // Obtain the initial match length. The match length is the length of the duplicate segment
-        // which will later be copied from data previously decompressed into the output buffer. The
-        // initial length is derived from the second part of the token (the lower nibble), we read
-        // earlier. Since having a match length of less than 4 would mean negative compression
-        // ratio, we start at 4 (MINMATCH).
-
-        // The initial match length can maximally be 19 (MINMATCH + 15). As with the literal length,
-        // this indicates that there are more bytes to read.
-        let mut match_length = MINMATCH + (token & 0xF) as usize;
-        if match_length == MINMATCH + 15 {
-            // The match length took the maximal value, indicating that there is more bytes. We
-            // read the extra integer.
-            match_length += read_integer_ptr(&mut input_ptr, input_ptr_end)? as usize;
-        }
-
-        // We now copy from the already decompressed buffer. This allows us for storing duplicates
-        // by simply referencing the other location.
-        let output_len = unsafe { output_ptr.offset_from(output_base) as usize };
-
-        // could be skipped with unchecked-decode
-        {
-            if offset > output_len + ext_dict.len() {
-                return Err(DecompressError::OffsetOutOfBounds);
-            }
-            if match_length > unsafe { output_end.offset_from(output_ptr) as usize } {
-                return Err(DecompressError::OutputTooSmall {
-                    expected: output_len + match_length,
-                    actual: output.capacity(),
-                });
-            }
-        }
-
-        if USE_DICT && offset > output_len {
-            let copied = unsafe {
-                copy_from_dict(output_base, &mut output_ptr, ext_dict, offset, match_length)
-            };
-            if copied == match_length {
-                // could be skipped with unchecked-decode
-                {
-                    if input_ptr >= input_ptr_end {
-                        return Err(DecompressError::ExpectedAnotherByte);
-                    }
-                }
-
-                continue;
-            }
-            // match crosses ext_dict and output
-            match_length -= copied;
-        }
-
-        // Calculate the start of this duplicate segment. At this point offset was already checked
-        // to be in bounds and the external dictionary copy, if any, was already copied and
-        // subtracted from match_length.
-        let start_ptr = unsafe { output_ptr.sub(offset) };
-        debug_assert!(start_ptr >= output_base);
-        debug_assert!(start_ptr < output_end);
-        debug_assert!(unsafe { output_end.offset_from(start_ptr) as usize } >= match_length);
-        unsafe {
-            duplicate(&mut output_ptr, output_end, start_ptr, match_length);
-        }
-        // could be skipped with unchecked-decode
-        {
-            if input_ptr >= input_ptr_end {
-                return Err(DecompressError::ExpectedAnotherByte);
-            }
-        }
-    }
-    unsafe {
-        output.set_pos(output_ptr.offset_from(output_base) as usize);
-        Ok(output_ptr.offset_from(output_start_pos_ptr) as usize)
-    }
+/// Decompresses into the spare capacity of a fresh `Vec` without zero-filling it first.
+#[cfg(feature = "alloc")]
+#[inline]
+fn decompress_to_vec<const USE_DICT: bool>(
+    input: &[u8],
+    min_uncompressed_size: usize,
+    ext_dict: &[u8],
+) -> Result<Vec<u8>, DecompressError> {
+    let mut vec = Vec::with_capacity(min_uncompressed_size);
+    let len = decompress_core::<USE_DICT>(input, vec.spare_capacity_mut(), 0, ext_dict)?;
+    // SAFETY: `decompress_core` returns a position `len <= capacity` such that `[..len]` is
+    // initialized.
+    unsafe { vec.set_len(len) };
+    Ok(vec)
 }
 
 /// Decompress all bytes of `input` into `output`.
 /// `output` should be preallocated with a size of of the uncompressed data.
 #[inline]
 pub fn decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize, DecompressError> {
-    decompress_internal::<false, _>(input, &mut SliceSink::new(output, 0), b"")
+    decompress_internal::<false>(input, &mut SliceSink::new(output, 0), b"")
 }
 
 /// Decompress all bytes of `input` into `output`.
@@ -473,7 +546,7 @@ pub fn decompress_into_with_dict(
     output: &mut [u8],
     ext_dict: &[u8],
 ) -> Result<usize, DecompressError> {
-    decompress_internal::<true, _>(input, &mut SliceSink::new(output, 0), ext_dict)
+    decompress_internal::<true>(input, &mut SliceSink::new(output, 0), ext_dict)
 }
 
 /// Decompress all bytes of `input` into a new vec.
@@ -491,14 +564,7 @@ pub fn decompress_with_dict(
     min_uncompressed_size: usize,
     ext_dict: &[u8],
 ) -> Result<Vec<u8>, DecompressError> {
-    // Allocate a vector to contain the decompressed stream.
-    let mut vec = Vec::with_capacity(min_uncompressed_size);
-    let decomp_len =
-        decompress_internal::<true, _>(input, &mut PtrSink::from_vec(&mut vec, 0), ext_dict)?;
-    unsafe {
-        vec.set_len(decomp_len);
-    }
-    Ok(vec)
+    decompress_to_vec::<true>(input, min_uncompressed_size, ext_dict)
 }
 
 /// Decompress all bytes of `input` into a new vec. The first 4 bytes are the uncompressed size in
@@ -521,14 +587,7 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, DecompressErro
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 #[inline]
 pub fn decompress(input: &[u8], min_uncompressed_size: usize) -> Result<Vec<u8>, DecompressError> {
-    // Allocate a vector to contain the decompressed stream.
-    let mut vec = Vec::with_capacity(min_uncompressed_size);
-    let decomp_len =
-        decompress_internal::<true, _>(input, &mut PtrSink::from_vec(&mut vec, 0), b"")?;
-    unsafe {
-        vec.set_len(decomp_len);
-    }
-    Ok(vec)
+    decompress_to_vec::<false>(input, min_uncompressed_size, b"")
 }
 
 /// Decompress all bytes of `input` into a new vec. The first 4 bytes are the uncompressed size in
@@ -636,5 +695,178 @@ mod test {
             decompress(&[0x0E, 0, 0, 0x70, 0, 0, 0, 0, 0, 0, 0], 256),
             Err(DecompressError::OffsetZero)
         ));
+    }
+}
+
+/// Kani proofs. Run with `cargo kani --no-default-features -Z uninit-checks`.
+///
+/// The step proofs are the inductive argument. Every state that satisfies the [`Decoder`]
+/// invariants satisfies them again after one [`Decoder::step`], with no undefined behavior on
+/// the way. `decompress_core` starts in such a state, so the loop is safe for inputs with any
+/// number of sequences. Buffer sizes are bounded (`IN`, `OUT`, `DICT`), but large enough that
+/// every margin check in the decoder can go both ways.
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    const IN: usize = 24;
+    const OUT: usize = 64;
+    const DICT: usize = 20;
+
+    fn any_prefix<const N: usize>(buf: &[u8; N]) -> &[u8] {
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        &buf[..len]
+    }
+
+    /// An output buffer whose first `op` bytes are initialized and the rest uninitialized.
+    fn any_out<const N: usize>(op: usize) -> [MaybeUninit<u8>; N] {
+        let init: [u8; N] = kani::any();
+        let mut out = [MaybeUninit::uninit(); N];
+        for i in 0..op {
+            out[i] = MaybeUninit::new(init[i]);
+        }
+        out
+    }
+
+    fn assert_init_prefix(out: &[MaybeUninit<u8>], len: usize) {
+        for byte in &out[..len] {
+            // With `-Z uninit-checks`, Kani fails this read if the byte is uninitialized.
+            let _ = unsafe { byte.assume_init() };
+        }
+    }
+
+    fn check_step<const USE_DICT: bool>() {
+        let input_buf: [u8; IN] = kani::any();
+        let input = any_prefix(&input_buf);
+        let dict_buf: [u8; DICT] = kani::any();
+        let ext_dict: &[u8] = if USE_DICT { any_prefix(&dict_buf) } else { &[] };
+        let ip: usize = kani::any();
+        kani::assume(ip <= input.len());
+        let out_len: usize = kani::any();
+        kani::assume(out_len <= OUT);
+        let op: usize = kani::any();
+        kani::assume(op <= out_len);
+        let mut out_buf = any_out::<OUT>(op);
+
+        let mut decoder = Decoder::<USE_DICT> {
+            input,
+            ip,
+            out: &mut out_buf[..out_len],
+            op,
+            ext_dict,
+        };
+        let _ = decoder.step();
+
+        assert!(decoder.ip <= decoder.input.len());
+        assert!(decoder.op <= decoder.out.len());
+        assert_init_prefix(decoder.out, decoder.op);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(66)]
+    fn step_preserves_invariants() {
+        check_step::<false>();
+    }
+
+    #[kani::proof]
+    #[kani::unwind(66)]
+    fn step_preserves_invariants_with_dict() {
+        check_step::<true>();
+    }
+
+    /// End to end on all small inputs, starting from an entirely uninitialized output.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn decompress_core_small_inputs() {
+        let input_buf: [u8; 8] = kani::any();
+        let input = any_prefix(&input_buf);
+        let dict_buf: [u8; 4] = kani::any();
+        let ext_dict = any_prefix(&dict_buf);
+        let mut out = [MaybeUninit::<u8>::uninit(); 16];
+        if let Ok(end) = decompress_core::<true>(input, &mut out, 0, ext_dict) {
+            assert!(end <= out.len());
+            assert_init_prefix(&out, end);
+        }
+    }
+
+    // The primitives, each checked against exactly its stated precondition.
+
+    #[kani::proof]
+    fn prim_copy_fixed() {
+        let src_buf: [u8; 40] = kani::any();
+        let src = any_prefix(&src_buf);
+        let mut dst_buf = [MaybeUninit::<u8>::uninit(); 40];
+        let dst_len: usize = kani::any();
+        kani::assume(dst_len <= 40);
+        let dst = &mut dst_buf[..dst_len];
+        let (s, d): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(s <= src.len() && 16 <= src.len() - s);
+        kani::assume(d <= dst.len() && 16 <= dst.len() - d);
+        unsafe { prim::copy_fixed::<16>(src, s, dst, d) };
+        let i: usize = kani::any();
+        kani::assume(i < 16);
+        assert!(unsafe { dst[d + i].assume_init() } == src[s + i]);
+    }
+
+    #[kani::proof]
+    fn prim_copy_within_fixed() {
+        let len: usize = kani::any();
+        kani::assume(len <= 40);
+        let mut buf = any_out::<40>(len);
+        let out = &mut buf[..len];
+        let (from, to): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(from <= out.len() && 18 <= out.len() - from);
+        kani::assume(to <= out.len() && 18 <= out.len() - to);
+        unsafe { prim::copy_within_fixed::<18>(out, from, to) };
+    }
+
+    #[kani::proof]
+    fn prim_read_u16_le() {
+        let src_buf: [u8; 8] = kani::any();
+        let src = any_prefix(&src_buf);
+        let s: usize = kani::any();
+        kani::assume(s <= src.len() && 2 <= src.len() - s);
+        let v = unsafe { prim::read_u16_le(src, s) };
+        assert!(v == u16::from_le_bytes([src[s], src[s + 1]]));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn prim_copy_var() {
+        let src_buf: [u8; 40] = kani::any();
+        let src = any_prefix(&src_buf);
+        let mut dst_buf = [MaybeUninit::<u8>::uninit(); 40];
+        let dst_len: usize = kani::any();
+        kani::assume(dst_len <= 40);
+        let dst = &mut dst_buf[..dst_len];
+        let (s, d, len): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        kani::assume(len >= 1);
+        kani::assume(s <= src.len() && len <= src.len() - s);
+        kani::assume(d <= dst.len() && len <= dst.len() - d);
+        unsafe { prim::copy_var(src, s, dst, d, len) };
+        let i: usize = kani::any();
+        kani::assume(i < len);
+        assert!(unsafe { dst[d + i].assume_init() } == src[s + i]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(22)]
+    fn prim_copy_overlapping() {
+        let mut buf = any_out::<40>(40);
+        let (from, to, len): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        kani::assume(from < to && to <= buf.len() && len <= buf.len() - to);
+        unsafe { prim::copy_overlapping(&mut buf, from, to, len) };
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn prim_wild_copy_within_16() {
+        let mut buf = any_out::<64>(64);
+        let (from, to, len): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        kani::assume(len >= 1);
+        kani::assume(from <= to && len + 15 <= to - from);
+        kani::assume(to <= buf.len() && len + 15 <= buf.len() - to);
+        unsafe { prim::wild_copy_within_16(&mut buf, from, to, len) };
     }
 }

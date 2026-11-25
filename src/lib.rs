@@ -106,8 +106,7 @@ pub mod frame;
 #[allow(dead_code)]
 mod fastcpy;
 
-#[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
-#[allow(dead_code)]
+#[cfg(not(feature = "safe-decode"))]
 mod fastcpy_unsafe;
 
 #[deprecated(
